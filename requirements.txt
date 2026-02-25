@@ -1,0 +1,6 @@
+streamlit
+docker
+pandas
+plotly
+watchdog
+python-dotenv

@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  monitor:
+    build: .
+    container_name: monitor-hub
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8599:8501"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
