@@ -47,12 +47,12 @@ This is the main view. Containers are grouped by their **Instance Name** (the fo
 *   Expand an instance to see its specific services (e.g., `workspace`, `gallery`, `video`).
 *   Check their Uptime and Status at a glance.
 
-### 3. Container Inspector
-Scroll down to the "Container Inspector" section to drill down:
-*   **Select a Container**: Pick any container from the dropdown list.
-*   **Controls**: Use the **Restart** button to reboot a stuck container.
-*   **Live Stats**: View real-time **CPU Usage** and **Memory Usage**.
-*   **Logs**: View the last 100 lines of logs for quick debugging.
+### 3. Live Grid Dashboard
+The dashboard displays a real-time grid of all running containers:
+*   **Visual Status**: Green/Red indicators for container health.
+*   **Sparkline Graphs**: Live line charts showing CPU and Memory usage history over the last few minutes.
+*   **Parallel Monitoring**: Data is fetched in parallel to ensure the dashboard remains responsive even with many containers.
+*   **Controls**: Quickly restart any container directly from its card if it stops running.
 
 ## 🔧 Troubleshooting
 

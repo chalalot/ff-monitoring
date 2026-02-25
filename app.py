@@ -3,7 +3,9 @@ import docker
 import pandas as pd
 import time
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(page_title="Docker Monitor Hub", layout="wide", page_icon="🐳")
 
@@ -59,177 +61,172 @@ def format_bytes(size):
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
+def get_container_stats(container):
+    try:
+        if container.status != 'running':
+            return None
+        
+        # stream=False waits for a sample to calculate CPU. 
+        # This is slow, so we run it in parallel threads.
+        stats = container.stats(stream=False)
+        
+        cpu = calculate_cpu_percent(stats)
+        mem_usage = stats['memory_stats']['usage']
+        mem_limit = stats['memory_stats']['limit']
+        mem_percent = (mem_usage / mem_limit) * 100.0
+        
+        return {
+            'id': container.short_id,
+            'cpu': cpu,
+            'memory_mb': mem_usage / (1024 * 1024),
+            'memory_percent': mem_percent,
+            'timestamp': datetime.now()
+        }
+    except Exception as e:
+        return None
+
 # --- Main App ---
 
 st.title("🐳 Docker Monitoring Hub")
-st.markdown("Monitor all your running application instances in one place.")
 
 client = get_docker_client()
 
 if not client:
     st.stop()
 
-# Auto-Refresh Control
+# Initialize Session State for History
+if 'history' not in st.session_state:
+    st.session_state.history = {} # { container_id: { 'cpu': [], 'memory': [], 'timestamps': [] } }
+
+# Sidebar Controls
 refresh_interval = st.sidebar.slider("Refresh Interval (s)", 2, 60, 5)
-if st.sidebar.button("Force Refresh"):
+history_window = st.sidebar.slider("History Window (Points)", 10, 100, 30)
+auto_refresh = st.sidebar.checkbox("Auto-Refresh", value=True)
+
+if st.sidebar.button("Clear History"):
+    st.session_state.history = {}
     st.rerun()
 
-# --- Fetch Data ---
+# --- Fetch Data (Parallel) ---
 
 containers = client.containers.list(all=True)
-data = []
+running_containers = [c for c in containers if c.status == 'running']
 
+# Update Stats if Auto-Refresh or Manual
+if auto_refresh:
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(get_container_stats, running_containers))
+    
+    # Update History
+    for res in results:
+        if res:
+            cid = res['id']
+            if cid not in st.session_state.history:
+                st.session_state.history[cid] = {'cpu': [], 'memory': [], 'timestamps': []}
+            
+            h = st.session_state.history[cid]
+            h['cpu'].append(res['cpu'])
+            h['memory'].append(res['memory_mb'])
+            h['timestamps'].append(res['timestamp'])
+            
+            # Trim History
+            if len(h['cpu']) > history_window:
+                h['cpu'] = h['cpu'][-history_window:]
+                h['memory'] = h['memory'][-history_window:]
+                h['timestamps'] = h['timestamps'][-history_window:]
+
+# --- Dashboard Rendering ---
+
+# Group Containers by Project
+projects = {}
 for c in containers:
-    # Try to identify project/instance from labels
     labels = c.labels
-    project = labels.get('com.docker.compose.project', 'Unknown')
-    service = labels.get('com.docker.compose.service', c.name)
-    
-    # Basic Info
-    status = c.status
-    state = c.attrs['State']
-    started_at = state.get('StartedAt', '')
-    if started_at:
-        try:
-            # Parse ISO format (e.g., 2023-10-27T10:00:00.123456789Z)
-            started_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
-            uptime = datetime.now(started_dt.tzinfo) - started_dt
-            uptime_str = str(uptime).split('.')[0]
-        except:
-            uptime_str = "N/A"
-    else:
-        uptime_str = "N/A"
+    project_name = labels.get('com.docker.compose.project', 'Unknown')
+    if project_name not in projects:
+        projects[project_name] = []
+    projects[project_name].append(c)
 
-    # Stats (This can be slow if we query all, so maybe optional or on drill-down)
-    # For overview, we might skip heavy stats or do them asynchronously?
-    # Streamlit runs sequentially. Let's try fetching stats with stream=False for running ones.
-    
-    cpu_usage = 0.0
-    mem_usage = 0.0
-    mem_limit = 0.0
-    mem_percent = 0.0
-    
-    if status == 'running':
-        try:
-            # stats(stream=False) can take time. Let's see if we can get quick snapshot?
-            # Actually, standard stats call blocks. 
-            # For a dashboard with many containers, this loop will be slow.
-            # OPTIMIZATION: Only fetch stats if 'Detailed Stats' is enabled or for specific view.
-            # For now, let's just get memory from 'top' or basic inspect? No, top gives processes.
-            # We'll skip deep stats in the main table for speed.
-            pass 
-        except:
-            pass
-    
-    data.append({
-        "ID": c.short_id,
-        "Name": c.name,
-        "Project (Instance)": project,
-        "Service": service,
-        "Status": status,
-        "State": state['Status'], # running, exited, etc.
-        "Uptime": uptime_str,
-        "Image": c.image.tags[0] if c.image.tags else c.image.id[:12]
-    })
-
-df = pd.DataFrame(data)
-
-# --- Dashboard Overview ---
-
-# Metrics
-total_containers = len(df)
-running_containers = len(df[df['Status'] == 'running'])
-projects = df['Project (Instance)'].unique()
-
-m1, m2, m3 = st.columns(3)
-m1.metric("Total Containers", total_containers)
-m2.metric("Running", running_containers)
-m3.metric("Active Instances", len(projects))
-
-st.divider()
-
-# --- Grouped View ---
-
-st.subheader("Instances Overview")
-
-# Group by Project
-if not df.empty:
-    for project in projects:
-        if project == 'Unknown':
-            continue
-            
-        with st.expander(f"📂 Instance: {project}", expanded=True):
-            proj_df = df[df['Project (Instance)'] == project]
-            
-            # Show table
-            st.dataframe(
-                proj_df[['Service', 'Status', 'Uptime', 'Name', 'ID']],
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            # Quick Actions (e.g. Restart all in project? Maybe too dangerous for now)
-            
-else:
-    st.info("No containers found.")
-
-# --- Detailed Stats (On Demand) ---
-
-st.divider()
-st.subheader("🔍 Container Inspector")
-
-selected_container_name = st.selectbox("Select Container to Inspect", df['Name'].tolist())
-
-if selected_container_name:
-    container = client.containers.get(selected_container_name)
-    
-    c1, c2 = st.columns(2)
-    
-    with c1:
-        st.markdown(f"**Status:** {container.status}")
-        st.markdown(f"**Image:** {container.image.tags}")
-        st.markdown(f"**ID:** `{container.short_id}`")
+# Render Grid
+for project_name, project_containers in projects.items():
+    if project_name == 'Unknown' and not project_containers:
+        continue
         
-        if st.button(f"Restart {selected_container_name}"):
-            with st.spinner(f"Restarting {selected_container_name}..."):
-                container.restart()
-            st.success("Restarted!")
-            st.rerun()
+    st.subheader(f"📂 Instance: {project_name}")
+    
+    # Create columns for grid layout (e.g. 3 cards per row)
+    cols = st.columns(3)
+    
+    for i, c in enumerate(project_containers):
+        col = cols[i % 3]
+        
+        with col:
+            with st.container(border=True):
+                # Header
+                status_color = "🟢" if c.status == 'running' else "cx🔴"
+                st.markdown(f"**{status_color} {c.name}**")
+                st.caption(f"ID: {c.short_id} | Image: {c.image.tags[0] if c.image.tags else 'N/A'}")
+                
+                # Stats & Graphs
+                if c.status == 'running':
+                    cid = c.short_id
+                    hist = st.session_state.history.get(cid, {})
+                    
+                    if hist and hist['cpu']:
+                        last_cpu = hist['cpu'][-1]
+                        last_mem = hist['memory'][-1]
+                        
+                        # Metrics Row
+                        m1, m2 = st.columns(2)
+                        m1.metric("CPU", f"{last_cpu:.1f}%")
+                        m2.metric("Mem", f"{last_mem:.0f} MB")
+                        
+                        # Sparkline Graph (CPU)
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            y=hist['cpu'],
+                            mode='lines',
+                            fill='tozeroy',
+                            line=dict(color='#00CC96', width=2),
+                            name='CPU'
+                        ))
+                        fig.update_layout(
+                            height=80,
+                            margin=dict(l=0, r=0, t=0, b=0),
+                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            showlegend=False
+                        )
+                        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                        
+                        # Sparkline Graph (Memory)
+                        fig_mem = go.Figure()
+                        fig_mem.add_trace(go.Scatter(
+                            y=hist['memory'],
+                            mode='lines',
+                            fill='tozeroy',
+                            line=dict(color='#636EFA', width=2),
+                            name='Memory'
+                        ))
+                        fig_mem.update_layout(
+                            height=80,
+                            margin=dict(l=0, r=0, t=0, b=0),
+                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            showlegend=False
+                        )
+                        st.plotly_chart(fig_mem, use_container_width=True, config={'displayModeBar': False})
+                        
+                    else:
+                        st.info("Waiting for data...")
+                else:
+                    st.warning(f"Status: {c.status}")
+                    if st.button("Restart", key=f"restart_{c.short_id}"):
+                         c.restart()
+                         st.rerun()
 
-    with c2:
-        # Fetch Real-time Stats Here
-        if container.status == 'running':
-            with st.spinner("Fetching live stats..."):
-                stats = container.stats(stream=False)
-                
-                # CPU
-                cpu = calculate_cpu_percent(stats)
-                
-                # Memory
-                mem_usage = stats['memory_stats']['usage']
-                mem_limit = stats['memory_stats']['limit']
-                mem_percent = (mem_usage / mem_limit) * 100.0
-                
-                st.metric("CPU Usage", f"{cpu:.2f}%")
-                st.metric("Memory Usage", f"{format_bytes(mem_usage)} / {format_bytes(mem_limit)} ({mem_percent:.1f}%)")
-                
-                # Network (Rx/Tx)
-                networks = stats['networks']
-                for net_name, net_data in networks.items():
-                    st.text(f"Network ({net_name}): Rx {format_bytes(net_data['rx_bytes'])} / Tx {format_bytes(net_data['tx_bytes'])}")
-        else:
-            st.warning("Container is not running.")
+    st.divider()
 
-    # Logs
-    with st.expander("View Logs (Last 100 lines)"):
-        if container.status == 'running':
-            logs = container.logs(tail=100).decode('utf-8')
-            st.code(logs)
-        else:
-            st.info("Container not running, fetching last logs...")
-            logs = container.logs(tail=100).decode('utf-8')
-            st.code(logs)
-
-# Auto-refresh loop
-time.sleep(refresh_interval)
-st.rerun()
+# Auto-refresh Loop
+if auto_refresh:
+    time.sleep(refresh_interval)
+    st.rerun()
