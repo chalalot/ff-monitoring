@@ -20,14 +20,33 @@ def get_docker_client():
 
 def calculate_cpu_percent(d):
     # CPU usage calculation based on Docker API stats
-    cpu_count = len(d["cpu_stats"]["cpu_usage"]["percpu_usage"])
+    # Handle different Docker API versions/cgroup structures
+    cpu_usage = d.get("cpu_stats", {}).get("cpu_usage", {})
+    precpu_usage = d.get("precpu_stats", {}).get("cpu_usage", {})
+    
+    # Get CPU count safely
+    percpu = cpu_usage.get("percpu_usage", [])
+    if percpu:
+        cpu_count = len(percpu)
+    else:
+        # Fallback for cgroup v2 or incomplete stats
+        cpu_count = d.get("cpu_stats", {}).get("online_cpus", 1)
+
     cpu_percent = 0.0
-    cpu_delta = float(d["cpu_stats"]["cpu_usage"]["total_usage"]) - \
-                float(d["precpu_stats"]["cpu_usage"]["total_usage"])
-    system_delta = float(d["cpu_stats"]["system_cpu_usage"]) - \
-                   float(d["precpu_stats"]["system_cpu_usage"])
-    if system_delta > 0.0:
-        cpu_percent = cpu_delta / system_delta * 100.0 * cpu_count
+    
+    # Calculate deltas with safety checks
+    cpu_total = float(cpu_usage.get("total_usage", 0.0))
+    precpu_total = float(precpu_usage.get("total_usage", 0.0))
+    
+    system_cpu = float(d.get("cpu_stats", {}).get("system_cpu_usage", 0.0))
+    presystem_cpu = float(d.get("precpu_stats", {}).get("system_cpu_usage", 0.0))
+    
+    cpu_delta = cpu_total - precpu_total
+    system_delta = system_cpu - presystem_cpu
+
+    if system_delta > 0.0 and cpu_delta > 0.0:
+        cpu_percent = (cpu_delta / system_delta) * cpu_count * 100.0
+    
     return cpu_percent
 
 def format_bytes(size):
